@@ -1,6 +1,6 @@
 (in-ns 'csneps.snip)
 
-(declare msgs-to-promote)
+(declare msgs-to-promote print-ptree)
 
 (defrecord PTree
   [tree
@@ -41,10 +41,22 @@
     [this]
     @(:matched-msgs this))
   (add-matched-and-sent-messages
-    [this matched sent]
+    [this matched sent] (add-matched-and-sent-messages this matched sent false))
+  (add-matched-and-sent-messages
+    [this matched sent _]
     (dosync
       (alter (:matched-msgs this) union matched)
-      (alter (:sent-msgs this) (partial merge-with union) sent))))
+      (alter (:sent-msgs this) (partial merge-with union) sent)))
+  (print-messages
+    [this]
+    (println "--- P-Tree ---")
+    (println "Matched Messages:")
+    (doseq [mm @(:matched-msgs this)] (println mm))
+    (println "Sent Messages:")
+    (doseq [[chtype sms] @(:sent-msgs this)
+            sm sms] (println chtype ":" sm))
+    (println "Working Messages:")
+    (print-ptree this)))
 
 (defrecord PNode
   [parent

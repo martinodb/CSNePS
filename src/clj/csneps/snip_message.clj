@@ -7,7 +7,16 @@
   (seen-message? [this msg]) ;; Sometimes you don't want to combine msgs, just check if you've already seen one.
   (get-matched-messages [this])
   (get-sent-messages [this chtype])
-  (add-matched-and-sent-messages [this matched sent]))
+  (add-matched-and-sent-messages [this matched sent] [this matched sent remove-matched-from-working?])
+  (print-messages [this]))
+
+(defmethod print-method csneps.snip.MessageStructure [o w]
+  (.write ^java.io.Writer w 
+    (str (print-messages o))))
+
+(prefer-method print-method csneps.snip.MessageStructure java.util.Map)
+(prefer-method print-method csneps.snip.MessageStructure clojure.lang.IPersistentMap)
+(prefer-method print-method csneps.snip.MessageStructure clojure.lang.IRecord)
 
 ;; Type options:
 ;; U-INFER
@@ -23,7 +32,10 @@
    support-set #{}
    antecedent-support-sets #{}
    type nil
-   true? true
+   ;; In the case of a u-infer message, u-true? tells the receiver what it's 
+   ;; new truth value is (i.e., whether to add the support-set to its OS, or
+   ;; to build its negation and add it there).
+   u-true? true 
    fwd-infer? false
    pos 0
    neg 0
@@ -35,7 +47,8 @@
   (.write ^java.io.Writer w 
     (str "(" (:priority o) ")"
          " From: " (if (:origin o) (print-str (:origin o)) "<?>")
-         " " (:type o) " (" (if (:true? o) "t" "f") ")"
+         " " (:type o) 
+         (when (= (:type o) 'U-INFER ) (str " (" (if (:u-true? o) "t" "f") ")"))
          " pos:" (:pos o) " neg:" (:neg o)
          " support: " (:support-set o)
          " substitution: " (:subst o)
@@ -87,24 +100,34 @@
 
 (defn derivative-message 
   "Creates a message just like <message>, but with the given keys switched for the given values"
-  [message & {:keys [origin priority subst support-set type true? fwd-infer? invoke-set taskid pos neg flaggedns]}]
-  (-> message 
-    (assoc :origin (or origin (:origin message)))
-    (assoc :priority (or priority (inc (:priority message))))
-    (assoc :subst (or subst (:subst message)))
-    (assoc :support-set (or support-set (:support-set message)))
-    (assoc :antecedent-support-sets #{})
-    (assoc :type (or type (:type message)))
-    (assoc :true? (if (nil? true?) (:true? message) true?))
-    (assoc :fwd-infer? (or fwd-infer? (:fwd-infer? message)))
-    (assoc :invoke-set (or invoke-set (if origin
-                                        (@future-fw-infer origin)
-                                        (when (:origin message) (@future-fw-infer (:origin message))))))
-    (assoc :taskid (or taskid (:taskid message)))
-    (assoc :pos (or pos (if (if (nil? true?) (:true? message) true?) 1 0)))
-    (assoc :neg (or neg (if (if (nil? true?) (:true? message) true?) 0 1)))
-    (assoc :flaggedns (or flaggedns 
-                          {(or origin (:origin message)) (if (nil? true?) (:true? message) true?)}))))
+  [message & {:keys [origin priority subst support-set type u-true? fwd-infer? invoke-set taskid pos neg flaggedns]}]
+  (let [new-u-true (cond 
+                     (and (nil? type) (not= (:type message) 'U-INFER)) true
+                     (and (not (nil? type)) (not= type 'U-INFER)) true
+                     ; (not= (or type (:type message)) 'U-INFER) true ;; default to true in messages of the wrong type
+                      (nil? u-true?) (:u-true? message)
+                      :default u-true?)
+        new-flaggedns (or flaggedns (:flaggedns message))
+        new-pos (or pos (if (empty? new-flaggedns)
+                          1
+                          (count (filter true? (vals new-flaggedns)))))
+        new-neg (max 0 (- (count new-flaggedns) new-pos))]; (or neg (count (filter false? (vals new-flaggedns))))]
+    (-> message 
+      (assoc :origin (or origin (:origin message)))
+      (assoc :priority (or priority (inc (:priority message))))
+      (assoc :subst (or subst (:subst message)))
+      (assoc :support-set (or support-set (:support-set message)))
+      (assoc :antecedent-support-sets #{})
+      (assoc :type (or type (:type message)))
+      (assoc :u-true? new-u-true)
+      (assoc :fwd-infer? (or fwd-infer? (:fwd-infer? message)))
+      (assoc :invoke-set (or invoke-set (if origin
+                                          (@future-fw-infer origin)
+                                          (when (:origin message) (@future-fw-infer (:origin message))))))
+      (assoc :taskid (or taskid (:taskid message)))
+      (assoc :pos new-pos)
+      (assoc :neg new-neg)
+      (assoc :flaggedns new-flaggedns))))
 
 (defn imessage-from-ymessage
   [message node]

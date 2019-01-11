@@ -17,23 +17,11 @@
 
 (def print-intermediate-results false)
 (def print-results-on-infer false)
-(def debug-features (ref #{}))
-(def debug-nodes (ref #{}))
 (def showproofs true)
 
-(defn print-debug
-  "Prints the message if any item from features is in debug-features, and 
-   if any of: any item in nodes is in debug-nodes or debug-nodes is empty 
-   or nodes is empty. Accepts either a set of nodes/features, or a single
-   one on their own."
-  [features nodes message]
-  (let [features (if (seqable? features) (set features) #{features})
-        nodes (if (and (seqable? nodes) (not (map? nodes))) (set nodes) #{nodes})] ;; Records are seqable.
-    (when (and (not (empty? (intersection features @debug-features)))
-               (or (empty? @debug-nodes) 
-                   (empty? nodes)
-                   (not (empty? (intersection nodes @debug-nodes)))))
-      (send screenprinter (fn [_]  (println message))))))
+(defn ig-debug-all []
+  (set-debug-features :msgtx, :msgrx, :valveselect, :bw, :cancel, :switch, :filter, :rui, :der, :newmsg, :os, :infer)
+  (set-debug-nodes))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;; 
 ;;; Concurrency control ;;;
@@ -456,7 +444,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn negation-elimination
-  "Invert the truth of the :true? key in the message, and pass onward."
+  "Invert the truth of the :u-true? key in the message, and pass onward."
   [message node]
   ;; new-msgs is used in this case, not because we want to combine messages, but
   ;; because we want to ensure we don't re-produce the same message.
@@ -464,12 +452,15 @@
         dermsg (derivative-message message
                                    :origin node
                                    :support-set (der-tag (:support-set message))
-                                   :true? (not (:true? message))
+                                   :u-true? (not (:u-true? message))
+                                   :flaggedns {node (:u-true? message)}
                                    :type 'U-INFER)
         uch (@u-channels node)]
+    
+    (print-debug :infer #{node} (print-str "INFER: negation-elimination" node "\n -- message:" message "\n    -- derived messages:" dermsg))
 
     (when (and showproofs 
-               (not (:true? message)))
+               (not (:u-true? message)))
       (doseq [u uch]
         (send screenprinter (fn [_] (print-proof-step (:destination u) 
                                                       (:support-set message)
@@ -477,27 +468,74 @@
     (when (seq new-msgs) 
       (zipmap uch (repeat (count uch) dermsg)))))
 
-;(defn negation-introduction
-;  "Pretty much conjunction-introduction, but with :neg instead of :pos"
-;  [message node]
-;  (let [new-ruis (get-new-messages (:msgs node) message)
-;        der-rui (some #(= (:neg %) (count @(:u-channels node))) new-ruis)
-;        dermsg (derivative-message message
-;                                   :origin node
-;                                   :support-set (conj (:support-set message) node) ;; TODO: THIS IS WRONG
-;                                   :true? true
-;                                   :type 'I-INFER)
-;        ich @(:i-channels node)]
-;    (when debug (send screenprinter (fn [_]  (println "N-Int" new-ruis "\n" der-rui))))
-;    (when der-rui
-;      (when showproofs 
-;        (send screenprinter (fn [_] (println "I derived: " node " by negation-introduction"))))
-;      (dosync (alter (:support node) conj (:support-set message)))
-;      [true nil (zipmap ich (repeat (count ich) dermsg))]))) ;;TODO: Fix this.
+(defn consensus-introduction
+  "This rule introduces conjunction or negation, since they are extremely similar."
+  [message node new-msgs rule-name pos-is-true?]
+  (let [true-msgs (if pos-is-true?
+                    (filter #(= (:pos %) (count (@u-channels node))) new-msgs)
+                    (filter #(= (:neg %) (count (@u-channels node))) new-msgs))
+        false-msgs (if pos-is-true?
+                     (filter #(pos? (:neg %)) new-msgs)
+                     (filter #(pos? (:pos %)) new-msgs))
+        dermsg-fn (fn [dermsgs truthval]
+                    (into {} (map #(vector % (derivative-message 
+                                             message
+                                             :origin node
+                                             :support-set (if (has-shared-os? (:antecedent-support-sets %))
+                                                            (der-tag (:support-set %))
+                                                            (ext-tag (:support-set %)))
+                                             :type 'I-INFER
+                                             :flaggedns {node truthval}))
+                                dermsgs)))
+        dermsgs-t (dermsg-fn true-msgs true) 
+        dermsgs-f (dermsg-fn false-msgs false)
+        ich (@i-channels node)]
+    
+    (print-debug :infer #{node} (print-str "INFER:" (if pos-is-true? "conjunction-introduction" "negation-introduction") 
+                                           node "\n -- message:" message "\n    -- True derived messages:" dermsgs-t "\n    -- False derived messages:" dermsgs-f))
 
+    (concat
+      (when (seq true-msgs)
+        (when showproofs
+          (doseq [[tmsg dermsg] dermsgs-t]
+            (send screenprinter (fn [_] (print-proof-step node 
+                                                          (:support-set tmsg)
+                                                          rule-name)))))
+        (add-matched-and-sent-messages (@msgs node) (set true-msgs) {:i-channel (set (vals dermsgs-t))})
+        (doall
+          (for [[_ dermsg] dermsgs-t]
+            [true (:support-set dermsg) (zipmap ich (repeat (count ich) dermsg))])))
+      (when (seq false-msgs)
+        ;; This isn't a perfect solution, but it will stop infinite generation of (not (not ... ))
+        ;; TODO: Somehow remove the new-msgs from the matched to allow later generation if needed.
+        (when-not (and (= (type-of node) :csneps.core/Negation)
+                       (empty? (build/find (list 'not node))))
+          (when showproofs
+            (doseq [[fmsg dermsg] dermsgs-f]
+              (send screenprinter (fn [_] (print-proof-step (build/variable-parse-and-build (list 'not node) :Propositional #{})
+                                                            (:support-set fmsg)
+                                                            rule-name)))))
+          (add-matched-and-sent-messages (@msgs node) (set false-msgs) {:i-channel (set (vals dermsgs-f))})
+          (doall
+            (for [[_ dermsg] dermsgs-f]
+              [false (:support-set dermsg) (zipmap ich (repeat (count ich) dermsg))])))))))
+
+(defn conjunction-introduction
+  "We are in an unasserted 'and' node, and would like to know if we now
+   can say it is true based on message."
+  [message node new-msgs]
+  (consensus-introduction message node new-msgs "conjunction-introduction" true))
+
+(defn negation-introduction
+  "We are in an unasserted 'nor' node, and would like to know if we now
+   can say it is true based on message."
+  [message node new-msgs]
+  (consensus-introduction message node new-msgs "negation-introduction" false)
+  ;; TODO: Also try negation-introduction-reductio.
+  )
 
 ;;; TODO: Building new contexts and such is probably the task for backward-infer.
-(defn negation-introduction
+(defn negation-introduction-reductio
   "Reductio ad Absurdum"
   [message node]
   (let [new-msgs (get-new-messages (@msgs node) message)]
@@ -506,7 +544,27 @@
     
     
   ))
-  
+
+(defn conjunction-elimination
+  "Since the and is true, send a U-INFER message to each of the
+   consequents."
+  [message node new-msgs]
+  (let [dermsg (derivative-message message 
+                                   :origin node
+                                   :support-set (der-tag (@support node)) ;(conj (:support-set message) node)
+                                   :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
+                                   :flaggedns {node true}
+                                   :type 'U-INFER)
+        uch (@u-channels node)]
+    (print-debug :infer #{node} (print-str "INFER: conjunction-elimination" node "\n -- message:" message "\n    -- derived messages:" dermsg))
+    (when showproofs
+      (doseq [u uch]
+        (when (build/pass-message? u dermsg)
+          (send screenprinter (fn [_] (print-proof-step (build/apply-sub-to-term (:destination u) (:subst dermsg))
+                                                        #{}
+                                                        node
+                                                        "conjunction-elimination"))))))
+    (zipmap uch (repeat (count uch) dermsg))))
 
 (defn numericalentailment-elimination
   "Since the implication is true, send a U-INFER message to each
@@ -516,13 +574,14 @@
     ;; If the node only requires 1 antecedent to be true, any incoming positive
     ;; antecedent is enough to fire the rule.
     (if (= (:min node) 1)
-      (when (:true? message)
+      (when (:u-true? message)
         ;(cancel-infer node nil (:taskid message) (:subst message) (:support-set message))
         (let [der-msg (derivative-message message 
                                           :origin node 
                                           :type 'U-INFER 
                                           :support-set (os-union (:support-set message) (@support node))
-                                          :true? true
+                                          :u-true? true
+                                          :flaggedns {node true}
                                           :taskid (:taskid message)
                                           :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true))]
           (add-matched-and-sent-messages (@msgs node) new-msgs {:u-channel #{der-msg}})
@@ -548,7 +607,8 @@
                                             :origin node 
                                             :type 'U-INFER 
                                             :support-set (os-union (:support-set message) (@support node))
-                                            :true? true 
+                                            :u-true? true 
+                                            :flaggedns {node true}
                                             :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
                                             :taskid (:taskid message))]
             ;(cancel-infer node nil (:taskid message) (:subst der-msg) (:support-set der-msg))
@@ -595,6 +655,7 @@
             (let [imsg (derivative-message message
                                            :origin node
                                            :support-set adjusted-supports
+                                           :flaggedns {node true}
                                            :type 'I-INFER)]
               (add-matched-and-sent-messages (@msgs node) (set match-msgs) {:i-channel #{imsg}})
               (doseq [cqch (@i-channels node)] 
@@ -603,73 +664,6 @@
               (send screenprinter (fn [_] (print-proof-step node 
                                                             adjusted-supports
                                                             "if-introduction"))))))))))
-
-(defn conjunction-elimination
-  "Since the and is true, send a U-INFER message to each of the
-   consequents."
-  [message node new-msgs]
-  (let [dermsg (derivative-message message 
-                                   :origin node
-                                   :support-set (der-tag (@support node)) ;(conj (:support-set message) node)
-                                   :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
-                                   :type 'U-INFER)
-        uch (@u-channels node)]
-    (print-debug :der #{node} (print-str "DER: Conjunction Elimination at" node))
-    (when showproofs
-      (doseq [u uch]
-        (when (build/pass-message? u dermsg)
-          (send screenprinter (fn [_] (print-proof-step (build/apply-sub-to-term (:destination u) (:subst dermsg))
-                                                        #{}
-                                                        node
-                                                        "conjunction-elimination"))))))
-    (zipmap uch (repeat (count uch) dermsg))))
-
-(defn conjunction-introduction
-  "We are in an unasserted 'and' node, and would like to know if we now
-   can say it is true based on message."
-  [message node new-msgs]
-  (let [true-msgs (filter #(= (:pos %) (count (@u-channels node))) new-msgs)
-        false-msgs(filter #(pos? (:neg %)) new-msgs)
-        dermsgs-t (into {} (map #(vector % (derivative-message 
-                                             message
-                                             :origin node
-                                             :support-set (if (has-shared-os? (:antecedent-support-sets %))
-                                                            (der-tag (:support-set %))
-                                                            (ext-tag (:support-set %)))
-                                             :type 'I-INFER
-                                             :true? true))
-                                true-msgs))
-        dermsgs-f (into {} (map #(vector % (derivative-message 
-                                             message
-                                             :origin node
-                                             :support-set (if (has-shared-os? (:antecedent-support-sets %))
-                                                            (der-tag (:support-set %))
-                                                            (ext-tag (:support-set %)))
-                                             :type 'I-INFER
-                                             :true? false))
-                                false-msgs))
-        ich (@i-channels node)]
-    (concat
-      (when (seq true-msgs)
-        (when showproofs
-          (doseq [[tmsg dermsg] dermsgs-t]
-            (send screenprinter (fn [_] (print-proof-step node 
-                                                          (:support-set tmsg)
-                                                          "conjunction-introduction")))))
-        (add-matched-and-sent-messages (@msgs node) (set true-msgs) {:i-channel (set (vals dermsgs-t))})
-        (doall
-          (for [[_ dermsg] dermsgs-t]
-            [true (:support-set dermsg) (zipmap ich (repeat (count ich) dermsg))])))
-      (when (seq false-msgs)
-        (when showproofs
-          (doseq [[fmsg dermsg] dermsgs-f]
-            (send screenprinter (fn [_] (print-proof-step (build/variable-parse-and-build (list 'not node) :Propositional)
-                                                          (:support-set fmsg)
-                                                          "conjunction-introduction")))))
-        (add-matched-and-sent-messages (@msgs node) (set false-msgs) {:i-channel (set (vals dermsgs-f))})
-        (doall
-          (for [[_ dermsg] dermsgs-f]
-            [false (:support-set dermsg) (zipmap ich (repeat (count ich) dermsg))]))))))
 
 (defn andor-elimination
   "Since the andor is true, we may have enough information to do elimination
@@ -687,7 +681,8 @@
         (let [der-msgs (into {} (map #(vector % (derivative-message %
                                                                     :origin node 
                                                                     :type 'U-INFER 
-                                                                    :true? false 
+                                                                    :u-true? false 
+                                                                    :flaggedns {node true}
                                                                     :support-set (os-union (:support-set %) (@support node))
                                                                     :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
                                                                     :taskid (:taskid message))) 
@@ -708,7 +703,7 @@
                                                                      "andor")
                                                                    "-elimination (1)")))))))
 
-        (add-matched-and-sent-messages (@msgs node) (set pos-matches) {:u-channel (set (vals der-msgs))})
+        (add-matched-and-sent-messages (@msgs node) (set pos-matches) {:u-channel (set (vals der-msgs))} false)
                 
         (into {} (for [[pos-match der-msg] der-msgs
                        u (@u-channels node)
@@ -720,7 +715,8 @@
         (let [der-msgs (into {} (map #(vector % (derivative-message %
                                                                     :origin node 
                                                                     :type 'U-INFER 
-                                                                    :true? true
+                                                                    :u-true? true
+                                                                    :flaggedns {node true}
                                                                     :support-set (os-union (:support-set %) (@support node))
                                                                     :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
                                                                     :taskid (:taskid message))) 
@@ -741,7 +737,7 @@
                                                                      "andor")
                                                                    "-elimination (2)")))))))
 
-        (add-matched-and-sent-messages (@msgs node) (set neg-matches) {:u-channel (set (vals der-msgs))})
+        (add-matched-and-sent-messages (@msgs node) (set neg-matches) {:u-channel (set (vals der-msgs))} false)
                 
         (into {} (for [[neg-match der-msg] der-msgs
                        u (@u-channels node)
@@ -778,7 +774,8 @@
                                                                 (der-tag (:support-set %))
                                                                 (ext-tag (:support-set %)))
                                                  :type 'I-INFER
-                                                 :true? true))
+                                                 :flaggedns {node true}
+                                                 :u-true? true))
                                     case2s))]
           (when showproofs 
             (doseq [[case2 dermsg] dermsgs]
@@ -800,7 +797,8 @@
                                                                 (der-tag (:support-set %))
                                                                 (ext-tag (:support-set %)))
                                                  :type 'I-INFER
-                                                 :true? true))
+                                                 :flaggedns {node true}
+                                                 :u-true? true))
                                     case1s))]
           (when showproofs 
             (doseq [[case1 dermsg] dermsgs]
@@ -834,7 +832,8 @@
         (let [der-msgs (into {} (map #(vector % (derivative-message %
                                                                    :origin node 
                                                                    :type 'U-INFER 
-                                                                   :true? true 
+                                                                   :u-true? true 
+                                                                   :flaggedns {node true}
                                                                    :support-set (os-union (:support-set %) (@support node))
                                                                    :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
                                                                    :taskid (:taskid message)))
@@ -854,7 +853,7 @@
                                                                    "thresh")                                                               
                                                                  "-elimination"))))))
           
-          (add-matched-and-sent-messages (@msgs node) (set more-than-min-true-match) {:u-channel (set (vals der-msgs))})
+          (add-matched-and-sent-messages (@msgs node) (set more-than-min-true-match) {:u-channel (set (vals der-msgs))} false)
           
           (into {} (for [[more-than-min-true-match der-msg] der-msgs
                          u (@u-channels node)
@@ -865,7 +864,8 @@
         (let [der-msgs (into {} (map #(vector % (derivative-message %
                                                                    :origin node 
                                                                    :type 'U-INFER 
-                                                                   :true? true 
+                                                                   :u-true? true 
+                                                                   :flaggedns {node true}
                                                                    :support-set (os-union (:support-set %) (@support node))
                                                                    :fwd-infer? (when (or (:fwd-infer? message) (seq (@future-fw-infer node))) true)
                                                                    :taskid (:taskid message)))
@@ -885,7 +885,7 @@
                                                                    "thresh")                                                               
                                                                  "-elimination"))))))
           
-          (add-matched-and-sent-messages (@msgs node) (set less-than-max-true-match) {:u-channel (set (vals der-msgs))})
+          (add-matched-and-sent-messages (@msgs node) (set less-than-max-true-match) {:u-channel (set (vals der-msgs))} false)
           
           (into {} (for [[less-than-max-true-match der-msg] der-msgs
                          u (@u-channels node)
@@ -917,7 +917,7 @@
         (dosync (alter instances assoc node (assoc (@instances node) (:subst message) instance))))))
       
   (when (analyticTerm? node) ;; This is a restriction.
-    (let [imsg (derivative-message message :origin node)]
+    (let [imsg (derivative-message message :origin node :flaggedns {node true})]
       (add-matched-and-sent-messages (@msgs node) #{(sanitize-message message)} {:i-channel #{imsg} :g-channel #{imsg}}) ;; Just gchans?
       (doseq [cqch (@i-channels node)] 
         (submit-to-channel cqch imsg)))))
@@ -949,6 +949,7 @@
                                              :origin node 
                                              :type 'I-INFER 
                                              :taskid (:taskid message)
+                                             :flaggedns {node true}
                                              :support-set (os-union (:support-set %) (@support node))) 
                         inst-msgs) ;; using fwd-infer here is a bit of a hack.
           ich (@i-channels node)]
@@ -1000,7 +1001,8 @@
                                          :origin node
                                          :support-set inst-support
                                          :subst expanded-subst
-                                         :true? true
+                                         :u-true? true
+                                         :flaggedns {node true}
                                          :type 'I-INFER
                                          :fwd-infer? (:fwd-infer? message)
                                          :taskid (:taskid message))]
@@ -1045,6 +1047,7 @@
                                           :support-set outgoing-support
                                           :subst expanded-subst
                                           :type 'I-INFER
+                                          :flaggedns {node true}
                                           :fwd-infer? (:fwd-infer? message)
                                           :taskid (:taskid message))]
           
@@ -1069,7 +1072,12 @@
     (let [new-ruis (get-new-messages (@msgs node) message)
           resct (count (@restriction-set node))
           der-msg-t (filter #(= (:pos %) resct) new-ruis)
-          new-msgs (map #(derivative-message % :origin node :type 'I-INFER :taskid (:taskid message) :fwd-infer? (:fwd-infer? message)) der-msg-t)
+          new-msgs (map #(derivative-message % 
+                                             :origin node 
+                                             :type 'I-INFER 
+                                             :taskid (:taskid message) 
+                                             :flaggedns {}
+                                             :fwd-infer? (:fwd-infer? message)) der-msg-t)
           gch (@g-channels node)]
       (print-debug :rui #{node} (print-str "NEW RUI: Arb/Qvar" new-ruis "\n -- at" node "\n   -- via new message" message))
       (when (seq der-msg-t)
@@ -1120,6 +1128,7 @@
                            % 
                            :origin node 
                            :taskid (:taskid message)
+                           :flaggedns {}
                            :subst (assoc 
                                     (:subst message) 
                                     node 
@@ -1166,6 +1175,7 @@
   (print-debug :infer #{node} (print-str "INFER: (intro) Inferring in:" node))
   (case (type-of node)
     :csneps.core/Conjunction (conjunction-introduction message node new-msgs)
+    :csneps.core/Negation (negation-introduction message node new-msgs)
     (:csneps.core/Andor 
      :csneps.core/Disjunction 
      :csneps.core/Xor
@@ -1190,7 +1200,7 @@
   ;; new belief, and attempt elimination.
   (when (and (= (:type message) 'U-INFER)
              (not (seen-message? (@msgs term) message)))
-    (let [result-term (if (:true? message)
+    (let [result-term (if (:u-true? message)
                         (build/apply-sub-to-term term (:subst message))
                         (build/build (list 'not (build/apply-sub-to-term term (:subst message))) :Proposition {} #{}))]
       
@@ -1218,6 +1228,7 @@
         (let [imsg (derivative-message message
                                      :origin term
                                      :support-set (@support result-term)
+                                     :flaggedns {term (:u-true? message)}
                                      :type 'I-INFER)]
           ;; Save the message for future terms which might have channels
           ;; from this. Sometimes necessary for forward focused reasoning.
@@ -1234,7 +1245,7 @@
       (when (get @(:future-bw-infer term) result-term)
         (cancel-infer-of term)))
     
-    (when (:true? message)
+    (when (:u-true? message)
       ;; Elimination after a U-INFER message is different. 
       ;; Need to look at already matched messages, and combine with the new support, and relay that. 
       ;; Since we reason in all contexts, it won't result in any new derivations, just new reasons for old ones.
@@ -1280,7 +1291,7 @@
       ;; AnalyticGeneric terms need to just forward the messages
       ;; on towards the variable term.
       (analyticTerm? term)
-      (let [imsg (derivative-message message :origin term)]
+      (let [imsg (derivative-message message :origin term :flaggedns {term true})]
         (when (@msgs term) (add-matched-and-sent-messages (@msgs term) #{(sanitize-message message)} {:i-channel #{imsg} :g-channel #{imsg}}))
         (when (:infer @debug-features) (send screenprinter (fn [_]  (println "INFER: AnalyticGeneric" term "forwarding message."))))
         (doseq [cqch (@i-channels term)] 
@@ -1300,12 +1311,13 @@
         (not (rule? term))
         (not (variableTerm? term)))
       (do 
-        (when (:true? message)
+        (when (:u-true? message)
           (dosync (alter-support term (os-concat (@support term) (:support-set message)))))
         ;; Send this new info onward
         (let [imsg (derivative-message message
                                        :origin term
                                        :support-set (:support-set message)
+                                       :flaggedns {term true}
                                        :type 'I-INFER)]
           ;; Save the message for future terms which might have channels
           ;; from this. Sometimes necessary for forward focused reasoning.
@@ -1330,7 +1342,7 @@
               ;; Update support.
               (let [resterm (if true?
                               term
-                              (build/variable-parse-and-build (list 'not term) :Propositional))]
+                              (build/variable-parse-and-build (list 'not term) :Propositional #{}))]
                 (dosync (alter-support resterm (os-concat (@support resterm) spt)))
                 (when print-intermediate-results (println "> " resterm)))
               ;; Send results.
@@ -1421,27 +1433,6 @@
     (alter future-fw-infer empty))
   (doseq [t (vals @TERMS)]
     (dosync (alter (:future-bw-infer t) empty))))
-  
-;;;;;;;;;;;;;;;;;;;;;;;
-;;; Debug Functions ;;;
-;;;;;;;;;;;;;;;;;;;;;;;
-
-;; valid options: :msgtx, :msgrx, :valveselect, :bw, :cancel, :switch, :filter, :rui, :der, :newmsg, :os
-(defn set-debug-features [& opts]
-  (dosync (ref-set debug-features (set opts))))
-
-;; Empty nodes list means debug all nodes.
-(defn set-debug-nodes [& nodes]
-  (dosync (ref-set debug-nodes (set (map get-term nodes)))))
-
-(defmacro ig-debug [& {:keys [features nodes] :or {features '() nodes '()}}]
-  `(do 
-     (set-debug-features ~@features)
-     (set-debug-nodes ~@nodes)))
-
-(defn ig-debug-all []
-  (set-debug-features :msgtx, :msgrx, :valveselect, :bw, :cancel, :switch, :filter, :rui, :der, :newmsg, :os)
-  (set-debug-nodes))
 
 (defn- print-valve [ch]
   (let [selectors-this-ct (filter #(clojure.set/subset? @(:hyps (ct/find-context (second %))) @(:hyps (ct/currentContext))) @(:valve-selectors ch))]
